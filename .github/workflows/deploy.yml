@@ -1,0 +1,240 @@
+name: Deploy Production
+
+on:
+  workflow_run:
+    workflows: ["Test Suite"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy (branch, tag, or SHA)
+        required: false
+        default: main
+      deploy_api:
+        description: Also deploy the nanobot-api service
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.prep.outputs.checkout_ref }}
+      image_repo: ${{ steps.prep.outputs.image_repo }}
+      image_ref: ${{ steps.tags.outputs.image_ref }}
+      deploy_api: ${{ steps.prep.outputs.deploy_api }}
+
+    steps:
+      - name: Prepare deployment metadata
+        id: prep
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          INPUT_DEPLOY_API: ${{ github.event.inputs.deploy_api }}
+        run: |
+          set -euo pipefail
+
+          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image_repo="ghcr.io/${owner_lc}/nanobot"
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            checkout_ref="$RUN_SHA"
+            deploy_branch="$RUN_BRANCH"
+            deploy_api=""
+          else
+            checkout_ref="${INPUT_REF:-main}"
+            deploy_api="${INPUT_DEPLOY_API:-false}"
+            if [ "$checkout_ref" = "main" ] || [ "$checkout_ref" = "refs/heads/main" ]; then
+              deploy_branch="main"
+            else
+              deploy_branch=""
+            fi
+          fi
+
+          echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+          echo "deploy_api=$deploy_api" >> "$GITHUB_OUTPUT"
+          echo "deploy_branch=$deploy_branch" >> "$GITHUB_OUTPUT"
+          echo "image_repo=$image_repo" >> "$GITHUB_OUTPUT"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.prep.outputs.checkout_ref }}
+
+      - name: Capture commit SHA
+        id: git
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        env:
+          IMAGE_REPO: ${{ steps.prep.outputs.image_repo }}
+          SHORT_SHA: ${{ steps.git.outputs.short_sha }}
+          DEPLOY_BRANCH: ${{ steps.prep.outputs.deploy_branch }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE_REPO}:sha-${SHORT_SHA}"
+            if [ "$DEPLOY_BRANCH" = "main" ]; then
+              echo "${IMAGE_REPO}:main"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REPO}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate production compose file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nanobot-home
+          : > /tmp/nanobot-secrets.env
+          NANOBOT_IMAGE="${{ steps.tags.outputs.image_ref }}" \
+          NANOBOT_ENV_FILE="/tmp/nanobot-secrets.env" \
+          NANOBOT_HOME="/tmp/nanobot-home" \
+            docker compose -f docker-compose.prod.yml config >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.git.outputs.full_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    if: needs.build-and-push.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT }}
+      SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      SERVER_APP_DIR: ${{ vars.SERVER_APP_DIR || '/opt/nanobot' }}
+      SERVER_ENV_FILE: ${{ vars.SERVER_ENV_FILE || '' }}
+      SERVER_NANOBOT_HOME: ${{ vars.SERVER_NANOBOT_HOME || '' }}
+      DEPLOY_API_DEFAULT: ${{ vars.NANOBOT_DEPLOY_API || 'false' }}
+
+    steps:
+      - name: Validate required deployment secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_USER"
+          test -n "$SERVER_SSH_KEY"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-and-push.outputs.checkout_ref }}
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${SERVER_PORT:-22}" "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload production compose file
+        shell: bash
+        run: |
+          set -euo pipefail
+          server_port="${SERVER_PORT:-22}"
+          server_app_dir="${SERVER_APP_DIR:-/opt/nanobot}"
+
+          ssh -p "$server_port" "$SERVER_USER@$SERVER_HOST" "mkdir -p '$server_app_dir'"
+          scp -P "$server_port" docker-compose.prod.yml "$SERVER_USER@$SERVER_HOST:$server_app_dir/docker-compose.prod.yml"
+
+      - name: Deploy on server
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image_ref }}
+          DEPLOY_API_INPUT: ${{ needs.build-and-push.outputs.deploy_api }}
+        run: |
+          set -euo pipefail
+
+          server_port="${SERVER_PORT:-22}"
+          server_app_dir="${SERVER_APP_DIR:-/opt/nanobot}"
+          server_nanobot_home="${SERVER_NANOBOT_HOME:-/home/${SERVER_USER}/.nanobot}"
+          server_env_file="${SERVER_ENV_FILE:-/home/${SERVER_USER}/nanobot_secrets.env}"
+          deploy_api="${DEPLOY_API_INPUT:-$DEPLOY_API_DEFAULT}"
+          [ "$deploy_api" = "true" ] || deploy_api="false"
+
+          image_ref_q="$(printf '%q' "$IMAGE_REF")"
+          server_app_dir_q="$(printf '%q' "$server_app_dir")"
+          server_nanobot_home_q="$(printf '%q' "$server_nanobot_home")"
+          server_env_file_q="$(printf '%q' "$server_env_file")"
+          ghcr_username_q="$(printf '%q' "${GHCR_USERNAME:-}")"
+          ghcr_token_q="$(printf '%q' "${GHCR_TOKEN:-}")"
+          deploy_api_q="$(printf '%q' "$deploy_api")"
+
+          ssh -p "$server_port" "$SERVER_USER@$SERVER_HOST" \
+            "IMAGE_REF=$image_ref_q SERVER_APP_DIR=$server_app_dir_q SERVER_NANOBOT_HOME=$server_nanobot_home_q SERVER_ENV_FILE=$server_env_file_q GHCR_USERNAME=$ghcr_username_q GHCR_TOKEN=$ghcr_token_q DEPLOY_API=$deploy_api_q bash -s" <<'EOF'
+          set -euo pipefail
+
+          mkdir -p "$SERVER_APP_DIR" "$SERVER_NANOBOT_HOME"
+          cd "$SERVER_APP_DIR"
+
+          if [ -n "${GHCR_TOKEN:-}" ] && [ -n "${GHCR_USERNAME:-}" ]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+          fi
+
+          NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
+            docker compose -f docker-compose.prod.yml pull nanobot-gateway
+
+          NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
+            docker compose -f docker-compose.prod.yml up -d nanobot-gateway
+
+          if [ "$DEPLOY_API" = "true" ]; then
+            NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
+              docker compose -f docker-compose.prod.yml --profile api pull nanobot-api
+
+            NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
+              docker compose -f docker-compose.prod.yml --profile api up -d nanobot-api
+          fi
+
+          curl -fsS --max-time 15 http://127.0.0.1:18790/health >/dev/null
+          EOF

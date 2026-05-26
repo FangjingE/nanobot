@@ -1,0 +1,55 @@
+name: nanobot
+
+x-common-config: &common-config
+  image: ${NANOBOT_IMAGE:-ghcr.io/fangjinge/nanobot:main}
+  env_file:
+    - ${NANOBOT_ENV_FILE:-/home/fanglaozu/nanobot_secrets.env}
+  volumes:
+    - ${NANOBOT_HOME:-/home/fanglaozu/.nanobot}:/home/nanobot/.nanobot
+  restart: unless-stopped
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18790/health', timeout=5).read()"]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 20s
+
+services:
+  nanobot-gateway:
+    <<: *common-config
+    container_name: nanobot-gateway
+    command: ["gateway"]
+    ports:
+      - "${NANOBOT_GATEWAY_PORT:-18790}:18790"
+      - "${NANOBOT_WEBSOCKET_PORT:-8765}:8765"
+
+  nanobot-api:
+    <<: *common-config
+    container_name: nanobot-api
+    profiles:
+      - api
+    command: ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/api-workspace"]
+    ports:
+      - "${NANOBOT_API_BIND:-127.0.0.1}:${NANOBOT_API_PORT:-8900}:8900"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8900/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  nanobot-cli:
+    <<: *common-config
+    profiles:
+      - cli
+    command: ["status"]
+    restart: "no"
+    stdin_open: true
+    tty: true
