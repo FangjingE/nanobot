@@ -148,8 +148,6 @@ jobs:
       SERVER_USER: ${{ secrets.SERVER_USER }}
       SERVER_PORT: ${{ secrets.SERVER_PORT }}
       SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       SERVER_APP_DIR: ${{ vars.SERVER_APP_DIR || '/opt/nanobot' }}
       SERVER_ENV_FILE: ${{ vars.SERVER_ENV_FILE || '' }}
       SERVER_NANOBOT_HOME: ${{ vars.SERVER_NANOBOT_HOME || '' }}
@@ -207,20 +205,14 @@ jobs:
           server_app_dir_q="$(printf '%q' "$server_app_dir")"
           server_nanobot_home_q="$(printf '%q' "$server_nanobot_home")"
           server_env_file_q="$(printf '%q' "$server_env_file")"
-          ghcr_username_q="$(printf '%q' "${GHCR_USERNAME:-}")"
-          ghcr_token_q="$(printf '%q' "${GHCR_TOKEN:-}")"
           deploy_api_q="$(printf '%q' "$deploy_api")"
 
           ssh -p "$server_port" "$SERVER_USER@$SERVER_HOST" \
-            "IMAGE_REF=$image_ref_q SERVER_APP_DIR=$server_app_dir_q SERVER_NANOBOT_HOME=$server_nanobot_home_q SERVER_ENV_FILE=$server_env_file_q GHCR_USERNAME=$ghcr_username_q GHCR_TOKEN=$ghcr_token_q DEPLOY_API=$deploy_api_q bash -s" <<'EOF'
+            "IMAGE_REF=$image_ref_q SERVER_APP_DIR=$server_app_dir_q SERVER_NANOBOT_HOME=$server_nanobot_home_q SERVER_ENV_FILE=$server_env_file_q DEPLOY_API=$deploy_api_q bash -s" <<'EOF'
           set -euo pipefail
 
           mkdir -p "$SERVER_APP_DIR" "$SERVER_NANOBOT_HOME"
           cd "$SERVER_APP_DIR"
-
-          if [ -n "${GHCR_TOKEN:-}" ] && [ -n "${GHCR_USERNAME:-}" ]; then
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-          fi
 
           NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
             docker compose -f docker-compose.prod.yml pull nanobot-gateway
