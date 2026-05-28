@@ -231,11 +231,51 @@ jobs:
             exit 1
           fi
 
+          wait_for_container_health() {
+            container_name="$1"
+            timeout_seconds="${2:-90}"
+            waited=0
+
+            while [ "$waited" -lt "$timeout_seconds" ]; do
+              if ! docker inspect "$container_name" >/dev/null 2>&1; then
+                sleep 2
+                waited=$((waited + 2))
+                continue
+              fi
+
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+              case "$status" in
+                healthy)
+                  return 0
+                  ;;
+                starting|running|"")
+                  sleep 2
+                  ;;
+                unhealthy|exited|dead)
+                  echo "Container $container_name is $status" >&2
+                  docker logs --tail 200 "$container_name" >&2 || true
+                  return 1
+                  ;;
+                *)
+                  sleep 2
+                  ;;
+              esac
+
+              waited=$((waited + 2))
+            done
+
+            echo "Timed out waiting for $container_name to become healthy" >&2
+            docker logs --tail 200 "$container_name" >&2 || true
+            return 1
+          }
+
           NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
             docker compose -f docker-compose.prod.yml pull nanobot-gateway
 
           NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
             docker compose -f docker-compose.prod.yml up -d nanobot-gateway
+
+          wait_for_container_health nanobot-gateway
 
           if [ "$DEPLOY_API" = "true" ]; then
             NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
@@ -243,7 +283,7 @@ jobs:
 
             NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
               docker compose -f docker-compose.prod.yml --profile api up -d nanobot-api
-          fi
 
-          curl -fsS --max-time 15 http://127.0.0.1:18790/health >/dev/null
+            wait_for_container_health nanobot-api
+          fi
           EOF
