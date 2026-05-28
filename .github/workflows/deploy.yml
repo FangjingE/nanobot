@@ -148,7 +148,7 @@ jobs:
       SERVER_USER: ${{ secrets.SERVER_USER }}
       SERVER_PORT: ${{ secrets.SERVER_PORT }}
       SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-      SERVER_APP_DIR: ${{ vars.SERVER_APP_DIR || '/opt/nanobot' }}
+      SERVER_APP_DIR: ${{ vars.SERVER_APP_DIR || '' }}
       SERVER_ENV_FILE: ${{ vars.SERVER_ENV_FILE || '' }}
       SERVER_NANOBOT_HOME: ${{ vars.SERVER_NANOBOT_HOME || '' }}
       DEPLOY_API_DEFAULT: ${{ vars.NANOBOT_DEPLOY_API || 'false' }}
@@ -181,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           server_port="${SERVER_PORT:-22}"
-          server_app_dir="${SERVER_APP_DIR:-/opt/nanobot}"
+          server_app_dir="${SERVER_APP_DIR:-/home/${SERVER_USER}/nanobot}"
 
           ssh -p "$server_port" "$SERVER_USER@$SERVER_HOST" "mkdir -p '$server_app_dir'"
           scp -P "$server_port" docker-compose.prod.yml "$SERVER_USER@$SERVER_HOST:$server_app_dir/docker-compose.prod.yml"
@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
 
           server_port="${SERVER_PORT:-22}"
-          server_app_dir="${SERVER_APP_DIR:-/opt/nanobot}"
+          server_app_dir="${SERVER_APP_DIR:-/home/${SERVER_USER}/nanobot}"
           server_nanobot_home="${SERVER_NANOBOT_HOME:-/home/${SERVER_USER}/.nanobot}"
           server_env_file="${SERVER_ENV_FILE:-/home/${SERVER_USER}/nanobot_secrets.env}"
           deploy_api="${DEPLOY_API_INPUT:-$DEPLOY_API_DEFAULT}"
@@ -213,6 +213,23 @@ jobs:
 
           mkdir -p "$SERVER_APP_DIR" "$SERVER_NANOBOT_HOME"
           cd "$SERVER_APP_DIR"
+
+          if [ ! -f "$SERVER_ENV_FILE" ]; then
+            echo "Expected env file was not found: $SERVER_ENV_FILE" >&2
+            exit 1
+          fi
+
+          if ! head -n 0 "$SERVER_ENV_FILE" >/dev/null 2>&1; then
+            echo "Env file cannot be opened by $(whoami): $SERVER_ENV_FILE" >&2
+            ls -ld "$(dirname "$SERVER_ENV_FILE")" >&2 || true
+            ls -l "$SERVER_ENV_FILE" >&2 || true
+            exit 1
+          fi
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is not accessible for user $(whoami). Add this user to the docker group or configure rootless Docker." >&2
+            exit 1
+          fi
 
           NANOBOT_IMAGE="$IMAGE_REF" NANOBOT_ENV_FILE="$SERVER_ENV_FILE" NANOBOT_HOME="$SERVER_NANOBOT_HOME" \
             docker compose -f docker-compose.prod.yml pull nanobot-gateway
